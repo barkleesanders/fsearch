@@ -51,6 +51,7 @@ unsafe impl GlobalAlloc for Alloc {
 #[global_allocator]
 static GLOBAL: Alloc = Alloc;
 
+#[cfg(target_os = "macos")]
 const USAGE: &str = "usage:
   fsearch <query...> [--json]   search (starts the daemon if needed)
   fsearch stdio                 JSON lines on stdin/stdout
@@ -61,6 +62,16 @@ const USAGE: &str = "usage:
   fsearch uninstall             remove the login agent (keeps the index)
   fsearch bench <query...>      time a query in-process against the saved index";
 
+#[cfg(not(target_os = "macos"))]
+const USAGE: &str = "usage:
+  fsearch <query...> [--json]   search (starts the daemon if needed)
+  fsearch stdio                 JSON lines on stdin/stdout
+  fsearch serve                 run the daemon in the foreground
+  fsearch status
+  fsearch install [--login]      copy to ~/.local/bin; --login also installs a systemd user unit
+  fsearch uninstall             remove the systemd unit (keeps the index)
+  fsearch bench <query...>      time a query in-process against the saved index";
+
 const LABEL: &str = "mt.nd.fsearch";
 
 fn home() -> String {
@@ -68,11 +79,19 @@ fn home() -> String {
 }
 
 fn data_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
     let d = PathBuf::from(home()).join("Library/Application Support/FSearch");
+    #[cfg(not(target_os = "macos"))]
+    let d = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(home()).join(".local/share"))
+        .join("fsearch");
     std::fs::create_dir_all(&d).ok();
     d
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
 }
@@ -81,6 +100,8 @@ fn main() {
     // Never let a search download iCloud placeholders: opening or listing a
     // dataless file/dir fails fast instead of materializing it.
     // (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)
+    // macOS only; no iCloud on Linux.
+    #[cfg(target_os = "macos")]
     unsafe { setiopolicy_np(3, 0, 1) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -165,14 +186,17 @@ fn bench(qs: &str) {
     eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", times[0].max(times[times.len() - 1]), times[times.len() / 2], times[0]);
 }
 
+#[cfg(target_os = "macos")]
 fn plist_path() -> PathBuf {
     PathBuf::from(home()).join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
 
+#[cfg(target_os = "macos")]
 fn launchctl(args: &[&str]) -> bool {
     std::process::Command::new("launchctl").args(args).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
+#[cfg(target_os = "macos")]
 fn domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
@@ -188,6 +212,14 @@ fn install(login: bool) {
         println!("installed {}; the daemon starts on first use", bin.display());
         return;
     }
+    #[cfg(target_os = "macos")]
+    install_login_macos(&bin);
+    #[cfg(not(target_os = "macos"))]
+    install_login_linux(&bin);
+}
+
+#[cfg(target_os = "macos")]
+fn install_login_macos(bin: &PathBuf) {
     let log = data_dir().join("daemon.log");
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -223,10 +255,49 @@ fn install(login: bool) {
     println!("installed {} (LaunchAgent {LABEL})", bin.display());
 }
 
+/// Linux: systemd user unit so the daemon starts at login.
+#[cfg(not(target_os = "macos"))]
+fn install_login_linux(bin: &PathBuf) {
+    let unit_dir = PathBuf::from(home()).join(".config/systemd/user");
+    std::fs::create_dir_all(&unit_dir).unwrap_or_else(|e| die(&format!("mkdir {}: {e}", unit_dir.display())));
+    let unit = format!(
+        "[Unit]\nDescription=fsearch whole-disk search daemon\nAfter=default.target\n\n[Service]\nExecStart={} serve\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
+        bin.display()
+    );
+    let path = unit_dir.join("fsearch.service");
+    std::fs::write(&path, unit).unwrap_or_else(|e| die(&format!("write {}: {e}", path.display())));
+    let ctl = |args: &[&str]| {
+        std::process::Command::new("systemctl")
+            .args(std::iter::once("--user").chain(args.iter().copied()))
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    ctl(&["daemon-reload"]);
+    if ctl(&["enable", "--now", "fsearch.service"]) {
+        println!("installed {} (systemd user unit fsearch.service)", bin.display());
+    } else {
+        println!(
+            "installed {} and wrote {}; systemctl --user failed (no user systemd?) — the daemon still starts on first use",
+            bin.display(),
+            path.display()
+        );
+    }
+}
+
 fn uninstall() {
-    launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
-    let _ = std::fs::remove_file(plist_path());
-    println!("removed LaunchAgent {LABEL}; index kept in {}", data_dir().display());
+    #[cfg(target_os = "macos")]
+    {
+        launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
+        let _ = std::fs::remove_file(plist_path());
+        println!("removed LaunchAgent {LABEL}; index kept in {}", data_dir().display());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = std::process::Command::new("systemctl").args(["--user", "disable", "--now", "fsearch.service"]).status();
+        let _ = std::fs::remove_file(PathBuf::from(home()).join(".config/systemd/user/fsearch.service"));
+        println!("removed systemd unit fsearch.service; index kept in {}", data_dir().display());
+    }
 }
 
 fn die(msg: &str) -> ! {

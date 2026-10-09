@@ -5,7 +5,10 @@
 
 pub mod content;
 mod engine;
+#[cfg(target_os = "macos")]
 mod fsevents;
+#[cfg(target_os = "linux")]
+mod watcher_linux;
 pub mod index;
 pub mod live;
 pub mod query;

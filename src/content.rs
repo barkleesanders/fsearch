@@ -962,7 +962,9 @@ fn read_pool() -> &'static rayon::ThreadPool {
             .thread_name(|i| format!("fsearch-read-{i}"))
             .start_handler(|_| {
                 // Someone is waiting on these reads: keep them off the slow
-                // cores and out of the throttled IO tiers.
+                // cores and out of the throttled IO tiers. (macOS QoS;
+                // no-op on Linux.)
+                #[cfg(target_os = "macos")]
                 unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
                 crate::no_materialize()
             })

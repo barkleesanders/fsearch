@@ -3,7 +3,10 @@
 //! that links this crate.
 
 use crate::content::{self, Content, Grep, GrepResult};
+#[cfg(target_os = "macos")]
 use crate::fsevents::{self, HISTORY_DONE, KERNEL_DROPPED, MUST_SCAN_SUBDIRS, USER_DROPPED};
+#[cfg(target_os = "linux")]
+use crate::watcher_linux::{self as fsevents, HISTORY_DONE, KERNEL_DROPPED, MUST_SCAN_SUBDIRS, USER_DROPPED};
 use crate::index::Index;
 use crate::live::{Applied, Live};
 use crate::query::{Query, Searcher};
@@ -109,6 +112,7 @@ fn log(msg: impl AsRef<str>) {
 
 /// Never let indexing download iCloud placeholders: on the calling thread,
 /// opening or listing a dataless file fails fast instead of materializing it.
+#[cfg(target_os = "macos")]
 pub fn no_materialize() {
     unsafe extern "C" {
         fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
@@ -117,6 +121,25 @@ pub fn no_materialize() {
     unsafe { setiopolicy_np(3, 1, 1) };
 }
 
+/// No iCloud on Linux: nothing to do.
+#[cfg(not(target_os = "macos"))]
+pub fn no_materialize() {}
+
+/// Thread QoS hints. macOS only; on Linux thread priority is left to the
+/// default scheduler (no-ops).
+#[cfg(target_os = "macos")]
+fn qos_user_interactive() {
+    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+}
+#[cfg(target_os = "macos")]
+fn qos_utility() {
+    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+}
+#[cfg(not(target_os = "macos"))]
+fn qos_user_interactive() {}
+#[cfg(not(target_os = "macos"))]
+fn qos_utility() {}
+
 /// Searches run here, at user-interactive QoS: an app's background executor
 /// (or any low-QoS caller) would otherwise put the scan on efficiency cores.
 fn search_pool() -> &'static rayon::ThreadPool {
@@ -124,9 +147,7 @@ fn search_pool() -> &'static rayon::ThreadPool {
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .thread_name(|i| format!("fsearch-search-{i}"))
-            .start_handler(|_| unsafe {
-                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-            })
+            .start_handler(|_| qos_user_interactive())
             .build()
             .unwrap()
     })
@@ -162,6 +183,11 @@ impl Engine {
         if !skip.is_empty() {
             let _ = walk::SKIP.set(skip);
         }
+        // Linux: the home directory is often its own mount, which the
+        // walker would otherwise not cross (macOS covers this via
+        // firmlinks, so /Users appears under / exactly once).
+        #[cfg(not(target_os = "macos"))]
+        let _ = walk::DESCEND.set(vec![opts.home.as_bytes().to_vec()]);
         let dir = opts.dir;
         let (tx, rx) = std::sync::mpsc::channel();
         let (ctx, crx) = std::sync::mpsc::channel();
@@ -366,30 +392,46 @@ fn wait_for_index(dir: &Path) -> Index {
 }
 
 #[rustfmt::skip]
+#[cfg(target_os = "macos")]
 const GATED_IN_HOME: &[&str] = &[
     "Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/Containers", "Library/Group Containers",
     "Library/CloudStorage", "Pictures/Photos Library.photoslibrary",
 ];
 
 /// Folders macOS guards with a consent prompt (or that hold other volumes).
+#[cfg(target_os = "macos")]
 pub fn gated(home: &str) -> Vec<Vec<u8>> {
     GATED_IN_HOME.iter().map(|d| format!("{home}/{d}").into_bytes()).chain([b"/Volumes".to_vec()]).collect()
 }
 
+/// No consent-gated folders on Linux, and other mounts are not crossed by
+/// the walker anyway.
+#[cfg(not(target_os = "macos"))]
+pub fn gated(_home: &str) -> Vec<Vec<u8>> {
+    Vec::new()
+}
+
 /// The system TCC database is readable only with Full Disk Access, and
 /// trying without it fails immediately (no prompt).
+#[cfg(target_os = "macos")]
 pub fn has_full_disk_access() -> bool {
     std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
+}
+
+/// No TCC on Linux: nothing is consent-gated.
+#[cfg(not(target_os = "macos"))]
+pub fn has_full_disk_access() -> bool {
+    true
 }
 
 fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
     // Indexing file contents is background work: utility QoS keeps it off
     // the user's way (lower CPU priority and IO tier).
-    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+    qos_utility();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
-        .start_handler(|_| unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+        .start_handler(|_| {
+            qos_utility();
             no_materialize();
         })
         .build()
@@ -494,14 +536,20 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     Index::load(&path).unwrap_or(idx)
 }
 
-unsafe extern "C" {
-    fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-}
-
 /// Hand freed allocator memory back to the OS after big transient work
 /// (index builds, content batches) instead of letting malloc cache it.
+#[cfg(target_os = "macos")]
 fn release_memory() {
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
     unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+}
+
+/// glibc equivalent: trim the heap top back to the OS.
+#[cfg(not(target_os = "macos"))]
+fn release_memory() {
+    unsafe { libc::malloc_trim(0) };
 }
 
 fn compact(shared: &Shared) {
